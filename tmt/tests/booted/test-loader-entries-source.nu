@@ -14,8 +14,8 @@
 # 7. Idempotent operation (no changes when kargs already match)
 # 8. Existing system kargs (root=, ostree=, etc.) preserved through changes
 # 9. --options "" (empty string) clears kargs without removing the source
-# 10. Staged deployment interaction (bootc switch + set-options-for-source
-#     preserves the pending image switch)
+# 10. Pending deployment interaction (set-options-for-source updates both
+#     the booted entry and the pending target)
 # 11. On UKI hosts the command fails cleanly (the cmdline is embedded in
 #     the signed UKI, so there is no options line to edit)
 #
@@ -296,6 +296,48 @@ def fifth_boot [] {
     print "ok: idempotent operation"
 
     # -- Staged deployment interaction --
+    if (is_composefs) {
+        # Exercise the pending-entry propagation without coupling this test to
+        # the substantially longer composefs image-switch path. Build the
+        # minimal state produced by a Type 1 composefs upgrade, then remove it
+        # before finishing so the fixture cannot be finalized on shutdown.
+        let staged_dir = "/boot/loader/entries.staged"
+        let staged_metadata = "/run/composefs/staged-deployment"
+        assert (not ($staged_dir | path exists)) "no deployment should already be staged"
+        assert (not ($staged_metadata | path exists)) "no staged metadata should already exist"
+
+        let booted_entry = booted_bls_entry
+        let staged_entry = $staged_dir | path join ($booted_entry | path basename)
+        let booted_digest_param = parse_cmdline | where {|k| $k | str starts-with "composefs=" } | first
+        let staged_digest = "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+        ^mkdir -p $staged_dir /run/composefs
+        open $booted_entry
+            | str replace $booted_digest_param $"composefs=($staged_digest)"
+            | save -f $staged_entry
+        {depl_id: $staged_digest, finalization_locked: false}
+            | to json
+            | save -f $staged_metadata
+
+        let result = do -i {
+            bootc loader-entries set-options-for-source --source tuned --options "nohz=on rcu_nocbs=2-7 skew_tick=1"
+        } | complete
+        let staged = try { open $staged_entry } catch { "" }
+        let booted = try { open (booted_bls_entry) } catch { "" }
+
+        # Clean up before checking the result so a test failure cannot leave a
+        # fake deployment for a later finalize operation to activate.
+        ^rm -f $staged_metadata
+        ^rm -rf $staged_dir
+
+        assert ($result.exit_code == 0) $"set-options-for-source failed: ($result.stderr)"
+        assert ($staged | str contains "skew_tick=1") "pending entry should receive source kargs"
+        assert ($booted | str contains "skew_tick=1") "booted entry should receive source kargs"
+        print "ok: pending composefs entry updated with booted entry"
+        tap ok
+        return
+    }
+
     # Build a derived image and switch to it (this stages a deployment).
     # Then call set-options-for-source on top. The staged deployment should
     # be replaced with one that has the new image AND the source kargs.

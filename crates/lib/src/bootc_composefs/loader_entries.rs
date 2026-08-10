@@ -42,6 +42,29 @@ fn read_entries(dir: &Dir) -> Result<Vec<(String, BLSConfig)>> {
         }
 
         let is_current_bootc_name = name.starts_with(TYPE1_ENTRY_CONF_PREFIX);
+        let file_type = ent
+            .file_type()
+            .with_context(|| format!("Reading type of BLS entry {name}"))?;
+        let is_regular = if file_type.is_file() {
+            true
+        } else {
+            match dir.metadata(&name) {
+                Ok(metadata) => metadata.is_file(),
+                Err(err) if !is_current_bootc_name => {
+                    tracing::debug!(entry = name, %err, "Ignoring unreadable foreign BLS entry path");
+                    false
+                }
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("Reading metadata for BLS entry {name}"));
+                }
+            }
+        };
+        if !is_regular {
+            tracing::debug!(entry = name, "Ignoring non-regular BLS entry path");
+            continue;
+        }
+
         let content = dir
             .read_to_string(&name)
             .with_context(|| format!("Reading BLS entry {name}"))?;
@@ -79,6 +102,16 @@ fn read_staged_digest(storage: &Storage) -> Result<Option<String>> {
     let staged: StagedDeployment =
         serde_json::from_str(&data).context("Parsing staged composefs deployment metadata")?;
     Ok(Some(staged.depl_id))
+}
+
+/// Discard staged metadata that names the booted deployment.
+///
+/// The staged-deployment file in `/run` survives a soft reboot into the
+/// deployment it described. A matching digest therefore means "already
+/// applied", not "pending". This mirrors status handling, which matches the
+/// booted deployment before considering staged metadata.
+fn effective_staged_digest(staged: Option<String>, booted_digest: &str) -> Option<String> {
+    staged.filter(|digest| digest != booted_digest)
 }
 
 /// Extract `x-options-source-*` keys from a parsed BLS config.
@@ -164,7 +197,8 @@ pub(crate) fn set_options_for_source_composefs(
     new_options: Option<&str>,
 ) -> Result<()> {
     let source = SourceName::parse(source)?;
-    let staged_digest = read_staged_digest(storage)?;
+    let staged_digest =
+        effective_staged_digest(read_staged_digest(storage)?, &booted_cfs.cmdline.digest);
     let boot_dir = storage.require_boot_dir()?;
     let changed = apply_to_boot_dir(
         boot_dir,
@@ -197,8 +231,11 @@ fn plan_entry_update(
     let mut matched = None;
     for (file_name, cfg) in read_entries(dir)? {
         if cfg.get_verity().is_ok_and(|digest| digest == target_digest) {
-            if matched.is_some() {
-                anyhow::bail!("Multiple BLS entries found for {deployment_kind} deployment");
+            if let Some((previous_name, _)) = &matched {
+                anyhow::bail!(
+                    "Multiple BLS entries found for {deployment_kind} deployment \
+                     ({previous_name} and {file_name}); remove the duplicate and retry"
+                );
             }
             matched = Some((file_name, cfg));
         }
@@ -262,7 +299,14 @@ fn apply_to_boot_dir(
             None
         }
         (None, Some(_)) => {
-            anyhow::bail!("Found staged deployment metadata without staged BLS entries")
+            // A torn upgrade, or a bootloader whose pending state lives
+            // elsewhere, can leave metadata without Type 1 entries. Updating
+            // only the booted entry would lose this change after the upgrade.
+            anyhow::bail!(
+                "A deployment is staged but {TYPE1_ENT_PATH_STAGED} is unavailable, \
+                 so the pending deployment cannot be updated. Complete or discard \
+                 the pending upgrade (e.g. `bootc upgrade` or reboot) and retry"
+            )
         }
     };
 
@@ -382,6 +426,24 @@ options root=LABEL=root rw composefs=abcd1234 rhgb quiet
     }
 
     #[test]
+    fn test_read_entries_ignores_non_regular_and_accepts_file_symlink() {
+        let td = fixture_boot_dir();
+        let entries = td.open_dir(TYPE1_ENT_PATH).unwrap();
+        entries.create_dir("snippets.conf").unwrap();
+        entries
+            .atomic_write("linked-target", entry_text(STAGED_DIGEST))
+            .unwrap();
+        entries.symlink("linked-target", "linked.conf").unwrap();
+        entries.symlink("missing.conf", "dangling.conf").unwrap();
+
+        let found = read_entries(&entries).unwrap();
+        assert_eq!(found.len(), 3);
+        assert!(found.iter().any(|(name, _)| name == "linked.conf"));
+        assert!(!found.iter().any(|(name, _)| name == "snippets.conf"));
+        assert!(!found.iter().any(|(name, _)| name == "dangling.conf"));
+    }
+
+    #[test]
     fn test_apply_to_boot_dir_targets_booted_entry_only() {
         let td = fixture_boot_dir();
         let source = SourceName::parse("admin").unwrap();
@@ -476,6 +538,57 @@ options root=LABEL=root rw composefs=abcd1234 rhgb quiet
             .read_to_string("bootc_dakota-20260809-1.conf")
             .unwrap();
         assert_eq!(stale, entry_text(STAGED_DIGEST));
+    }
+
+    #[test]
+    fn test_effective_staged_digest_discards_booted_match() {
+        assert_eq!(
+            effective_staged_digest(Some(BOOTED_DIGEST.into()), BOOTED_DIGEST),
+            None
+        );
+        assert_eq!(
+            effective_staged_digest(Some(STAGED_DIGEST.into()), BOOTED_DIGEST),
+            Some(STAGED_DIGEST.into())
+        );
+        assert_eq!(effective_staged_digest(None, BOOTED_DIGEST), None);
+    }
+
+    #[test]
+    fn test_duplicate_booted_entries_fail_naming_both_files() {
+        let td = fixture_boot_dir();
+        let entries = td.open_dir(TYPE1_ENT_PATH).unwrap();
+        entries
+            .atomic_write("backup.conf", entry_text(BOOTED_DIGEST))
+            .unwrap();
+
+        let source = SourceName::parse("admin").unwrap();
+        let err = apply_to_boot_dir(&td, BOOTED_DIGEST, None, &source, Some("amdgpu.runpm=0"))
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("backup.conf"));
+        assert!(message.contains("bootc_dakota-20260808-1.conf"));
+    }
+
+    #[test]
+    fn test_staged_digest_without_entries_dir_fails_before_write() {
+        let td = fixture_boot_dir();
+        let source = SourceName::parse("admin").unwrap();
+
+        let err = apply_to_boot_dir(
+            &td,
+            BOOTED_DIGEST,
+            Some(STAGED_DIGEST),
+            &source,
+            Some("amdgpu.runpm=0"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pending deployment"));
+
+        let entries = td.open_dir(TYPE1_ENT_PATH).unwrap();
+        let booted = entries
+            .read_to_string("bootc_dakota-20260808-1.conf")
+            .unwrap();
+        assert_eq!(booted, entry_text(BOOTED_DIGEST));
     }
 
     #[test]

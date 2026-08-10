@@ -296,17 +296,6 @@ def fifth_boot [] {
     print "ok: idempotent operation"
 
     # -- Staged deployment interaction --
-    if (is_composefs) {
-        # bootc switch is not yet functional on the composefs backend; all
-        # switch/upgrade plans carry fixme_skip_if_composefs upstream. Skip
-        # the staged-switch interaction for the same reason. The staged-
-        # entries propagation itself is covered by unit tests
-        # (bootc_composefs::loader_entries).
-        print "skip: staged deployment interaction (switch not yet supported on composefs)"
-        tap ok
-        return
-    }
-
     # Build a derived image and switch to it (this stages a deployment).
     # Then call set-options-for-source on top. The staged deployment should
     # be replaced with one that has the new image AND the source kargs.

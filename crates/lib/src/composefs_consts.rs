@@ -3,6 +3,8 @@ pub const COMPOSEFS_CMDLINE: &str = "composefs";
 
 /// Directory to store transient state, such as staged deployemnts etc
 pub(crate) const COMPOSEFS_TRANSIENT_STATE_DIR: &str = "/run/composefs";
+/// Path to the transient composefs state directory, relative to `/run`.
+pub(crate) const COMPOSEFS_TRANSIENT_STATE_DIR_RUN_RELATIVE: &str = "composefs";
 /// File created in /run/composefs to record a staged-deployment
 pub(crate) const COMPOSEFS_STAGED_DEPLOYMENT_FNAME: &str = "staged-deployment";
 
@@ -34,6 +36,9 @@ pub(crate) const STAGED_BOOT_LOADER_ENTRIES: &str = "entries.staged";
 pub(crate) const USER_CFG: &str = "user.cfg";
 /// Filename for staged grub user config
 pub(crate) const USER_CFG_STAGED: &str = "user.cfg.staged";
+
+/// Prefix used by current bootc-owned Type 1 entry filenames.
+pub(crate) const TYPE1_ENTRY_CONF_PREFIX: &str = "bootc_";
 
 /// Path to the config files directory for Type1 boot entries
 /// This is relative to the boot/efi directory

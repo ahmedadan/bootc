@@ -588,6 +588,11 @@ impl Storage {
         Ok(())
     }
 
+    /// Access runtime state rooted at `/run`.
+    pub(crate) fn run_dir(&self) -> &Dir {
+        &self.run
+    }
+
     /// Returns `boot_dir` if it exists
     pub(crate) fn require_boot_dir(&self) -> Result<&Dir> {
         self.boot_dir

@@ -834,7 +834,9 @@ pub(crate) enum LoaderEntriesOpts {
     /// keys in BLS config files. The `options` line is recomputed as the
     /// merge of all tracked sources plus any untracked (pre-existing) options.
     ///
-    /// This stages a new deployment with the updated kernel arguments.
+    /// On ostree, this stages a deployment with the updated kernel arguments.
+    /// On native composefs Type 1 systems, it updates the booted entry and any
+    /// pending deployment target in place. UKI entries are not supported.
     ///
     /// ## Examples
     ///

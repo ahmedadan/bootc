@@ -98,7 +98,9 @@ use serde::{Deserialize, Serialize};
 use crate::bootc_composefs::state::{get_booted_bls, write_composefs_state};
 use crate::bootc_composefs::status::ComposefsCmdline;
 use crate::bootc_kargs::compute_new_kargs;
-use crate::composefs_consts::{TYPE1_BOOT_DIR_PREFIX, TYPE1_ENT_PATH, TYPE1_ENT_PATH_STAGED};
+use crate::composefs_consts::{
+    TYPE1_BOOT_DIR_PREFIX, TYPE1_ENT_PATH, TYPE1_ENT_PATH_STAGED, TYPE1_ENTRY_CONF_PREFIX,
+};
 use crate::parsers::bls_config::{BLSConfig, BLSConfigType, EFIKey};
 use crate::spec::BootloaderKind;
 use crate::task::Task;
@@ -315,7 +317,7 @@ pub fn type1_entry_conf_file_name(
     priority: &str,
 ) -> String {
     let os_id_safe = os_id.replace('-', "_");
-    format!("bootc_{os_id_safe}-{version}-{priority}.conf")
+    format!("{TYPE1_ENTRY_CONF_PREFIX}{os_id_safe}-{version}-{priority}.conf")
 }
 
 /// Generate sort key for the primary (new/upgraded) boot entry.

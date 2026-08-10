@@ -14,12 +14,20 @@ keys in BLS config files on `/boot`. The `options` line is recomputed
 as the merge of all tracked sources plus any untracked (pre-existing)
 options.
 
-This command stages a new deployment with the updated kernel arguments.
-Changes take effect on the next reboot.
+Changes take effect on the next reboot. The update mechanism depends on
+the storage backend:
 
-When a staged deployment already exists (e.g. from `bootc upgrade`),
-it is replaced using the staged deployment's commit and origin,
-preserving the pending upgrade while layering the kargs change on top.
+- On ostree, the command stages a new deployment with the updated kernel
+  arguments. When a staged deployment already exists, it is replaced
+  using the staged deployment's commit and origin, preserving the pending
+  upgrade.
+- On native composefs systems using Type 1 BLS entries, the booted entry
+  is updated in place. If an upgrade is pending, its target entry is
+  updated as well while its future rollback entry remains unchanged. The
+  command does not itself stage a deployment.
+
+UKI (Type 2) entries are not supported because their kernel command line
+is embedded in the signed UKI.
 
 # OPTIONS
 
@@ -36,9 +44,11 @@ preserving the pending upgrade while layering the kargs change on top.
 
 # REQUIREMENTS
 
-This command requires ostree >= 2026.1 with `bootconfig-extra` support
-for preserving extension BLS keys through staged deployment roundtrips.
-On older ostree versions, the command will exit with an error.
+On the ostree backend, this command requires ostree >= 2026.1 with
+`bootconfig-extra` support for preserving extension BLS keys through
+staged deployment roundtrips. On older ostree versions, the command will
+exit with an error. Native composefs Type 1 systems do not have this
+ostree version requirement.
 
 # EXAMPLES
 
@@ -65,8 +75,8 @@ Multiple sources can coexist independently:
 
 # KNOWN LIMITATIONS
 
-Source keys set by prior calls in the same boot cycle (before any reboot)
-are discovered by reading the staged deployment data file at
+On the ostree backend, source keys set by prior calls in the same boot
+cycle are discovered by reading the staged deployment data file at
 `/run/ostree/staged-deployment`. If this file is missing or cannot be
 parsed, sources from prior calls may not be discovered, potentially
 orphaning their kargs. In practice this should not occur, as the file is

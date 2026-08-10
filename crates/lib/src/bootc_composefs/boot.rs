@@ -558,6 +558,11 @@ pub(crate) fn setup_composefs_bls_boot(
 ) -> Result<String> {
     let id_hex = id.to_hex();
 
+    // `x-options-source-*` keys inherited from the booted entry on upgrade,
+    // so source-tracked kargs (bootc loader-entries set-options-for-source)
+    // stay attributable across deployments. Empty on a fresh install.
+    let mut inherited_source_kargs: std::collections::HashMap<String, String> = Default::default();
+
     let (root_path, esp_device, mut cmdline_refs, bootloader) = match setup_type {
         BootSetupType::Setup((root_setup, state, postfetch)) => {
             // root_setup.kargs has [root=UUID=<UUID>, "rw"]
@@ -607,6 +612,13 @@ pub(crate) fn setup_composefs_bls_boot(
 
             let boot_dir = storage.require_boot_dir()?;
             let current_cfg = get_booted_bls(&boot_dir, booted_cfs)?;
+
+            inherited_source_kargs = current_cfg
+                .extra
+                .iter()
+                .filter(|(k, _)| k.starts_with(crate::loader_entries::OPTIONS_SOURCE_KEY_PREFIX))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
 
             let mut cmdline = match current_cfg.cfg_type {
                 BLSConfigType::NonEFI { options, .. } => {
@@ -729,6 +741,7 @@ pub(crate) fn setup_composefs_bls_boot(
                 .with_title(title)
                 .with_version(version)
                 .with_sort_key(sort_key)
+                .with_extra(inherited_source_kargs.clone())
                 .with_cfg(BLSConfigType::NonEFI {
                     linux: entry_paths
                         .abs_entries_path

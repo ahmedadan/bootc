@@ -12,6 +12,10 @@ use composefs_boot::bootloader::EFI_EXT;
 use composefs_ctl::composefs;
 use composefs_ctl::composefs_boot;
 use composefs_ctl::composefs_oci;
+use ostree_ext::composefs::fsverity::Sha512HashValue;
+use ostree_ext::composefs_oci::linked_erofs_images;
+use rustix::fs::AtFlags;
+use rustix::fs::{statat, unlinkat};
 
 use crate::{
     bootc_composefs::{
@@ -138,8 +142,9 @@ fn delete_kernel_initrd(storage: &Storage, dir_to_delete: &str, dry_run: bool) -
 fn delete_uki(storage: &Storage, uki_id: &str, dry_run: bool) -> Result<()> {
     let esp_mnt = storage.require_esp()?;
 
-    // NOTE: We don't delete global addons here
-    // Which is fine as global addons don't belong to any single deployment
+    // NOTE: We don't delete global addons here (see `GLOBAL_UKI_ADDONS_DIR`)
+    // Which is fine as global addons don't belong to any single deployment, but it also
+    // means they're never cleaned up at all: see the TODO on `GLOBAL_UKI_ADDONS_DIR`.
     let uki_dir = esp_mnt.fd.open_dir(BOOTC_UKI_DIR)?;
 
     for entry in uki_dir.entries_utf8()? {
@@ -346,7 +351,7 @@ pub(crate) async fn composefs_gc(
 
     // Collect the set of manifest digests referenced by live deployments,
     // and track EROFS image verities as fallback additional_roots for
-    // deployments that predate the manifest→image link.
+    // deployments that predate the manifest -> image link.
     let mut live_manifest_digests: Vec<composefs_oci::OciDigest> = Vec::new();
     let mut additional_roots = Vec::new();
     // Container image names for containers-storage pruning.
@@ -366,7 +371,7 @@ pub(crate) async fn composefs_gc(
         }
 
         // Keep the EROFS image as an additional root until all deployments
-        // have manifest→image refs. Once a deployment is pulled with the
+        // have manifest -> image refs. Once a deployment is pulled with the
         // new code, its EROFS image is reachable from the manifest and
         // this entry becomes redundant (but harmless).
         additional_roots.push(verity.clone());
@@ -483,16 +488,100 @@ pub(crate) async fn composefs_gc(
         }
     }
 
+    let (mut objects_bytes, mut objects_removed) = (0, 0);
+
+    // Now GC the UKI/UKI Addons from `.boot` EROFS if we have them
+    // These won't be GC'd by the above `repo.gc` as the EROFS have
+    // `/boot` masked
+    for verity in all_orphans {
+        let verity_to_sha = Sha512HashValue::from_hex(verity);
+
+        let Ok(verity_to_sha) = verity_to_sha else {
+            // We do not want to block on GC if we find corrupted state
+            tracing::warn!("Bad FSVerity '{verity}' when performing GC on orphan, skipping");
+            continue;
+        };
+
+        let linked_images = linked_erofs_images(&booted_cfs.repo, &verity_to_sha)
+            .with_context(|| anyhow::anyhow!("Getting linked images for {verity}"))?;
+
+        // Get any image that is non-bootable
+        let Some(non_bootable_img) = linked_images.iter().find(|img| !img.bootable) else {
+            tracing::debug!("No non-bootable image found for {verity}");
+            continue;
+        };
+
+        let boot_dump = composefs_ctl::dump_files(
+            &booted_cfs.repo,
+            &non_bootable_img.id.to_hex(),
+            &vec![std::path::PathBuf::from("/boot")],
+            false,
+        )
+        .context("Getting dump for /boot")?;
+
+        if boot_dump.is_empty() {
+            tracing::debug!("Nothing found in /boot in non-bootable image");
+            continue;
+        }
+
+        let boot_dump = std::str::from_utf8(&boot_dump).context("dumpfile is not UTF-8")?;
+
+        let objects_dir = booted_cfs
+            .repo
+            .objects_dir()
+            .context("Opening objects dir")?;
+
+        use composefs::dumpfile_parse::{Entry, Item};
+
+        for line in boot_dump.lines() {
+            let entry = Entry::parse(line).unwrap();
+
+            let Item::Regular { path, .. } = entry.item else {
+                continue;
+            };
+
+            tracing::debug!(
+                "{}: objects/{path:?}",
+                if gc_opts.dry_run {
+                    "would remove"
+                } else {
+                    "removing"
+                },
+            );
+
+            if gc_opts.dry_run {
+                continue;
+            }
+
+            // Get file size before removing
+            if let Ok(stat) = statat(&objects_dir, path.as_ref(), AtFlags::empty()) {
+                objects_bytes += stat.st_size as u64;
+            }
+
+            objects_removed += 1;
+
+            unlinkat(&objects_dir, path.as_ref(), AtFlags::empty())
+                .with_context(|| format!("Unlinking object {path:?}"))?;
+        }
+    }
+
     // Run garbage collection. Tags root the OCI metadata chain
     // (manifest → config → layers). The additional_roots protect EROFS
     // images for deployments that predate the manifest→image link;
     // once all deployments have been pulled with the new code, these
     // become redundant.
-    let gc_result = if gc_opts.dry_run {
+    // `Repository::gc()` takes an exclusive flock on the repository file as its
+    // first action. Callers must ensure no other `Repository` handle on that
+    // same underlying file is still alive when this runs, or it will deadlock
+    // (see update.rs's do_upgrade() for an example of getting this wrong).
+    let mut gc_result = if gc_opts.dry_run {
         booted_cfs.repo.gc_dry_run(&additional_roots)?
     } else {
         booted_cfs.repo.gc(&additional_roots)?
     };
+
+    gc_result.objects_bytes += objects_bytes;
+    gc_result.objects_removed += objects_removed;
 
     Ok(gc_result)
 }

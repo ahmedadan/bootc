@@ -2,23 +2,18 @@
 # tmt:
 #   summary: Test composefs garbage collection with same and different kernel+initrd
 #   duration: 30m
+# extra:
+#   skip_if_ostree: true
+#   fixme_skip_if_uki: true
 
 use std assert
 use tap.nu
-
-if not (tap is_composefs) {
-    exit 0
-}
 
 # bootc status
 let st = bootc status --json | from json
 let booted = $st.status.booted.image
 
 let dir_prefix = "bootc_composefs-"
-
-if ($st.status.booted.composefs.bootType | str downcase) == "uki" {
-    exit 0
-}
 
 # Create a large file in a new container image, then bootc switch to the image
 def first_boot [] {

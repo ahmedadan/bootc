@@ -64,7 +64,8 @@
 use std::cell::Cell;
 use std::fs::create_dir_all;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::os::fd::AsFd;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -77,7 +78,7 @@ use cap_std_ext::{
 use clap::ValueEnum;
 use composefs::fs::read_file;
 use composefs::fsverity::{FsVerityHashValue, Sha512HashValue};
-use composefs::tree::RegularFile;
+use composefs::tree::{FileSystem, RegularFile};
 use composefs_boot::bootloader::{
     BootEntry as ComposefsBootEntry, EFI_ADDON_DIR_EXT, EFI_ADDON_FILE_EXT, EFI_EXT, PEType,
     UsrLibModulesVmlinuz, get_boot_resources,
@@ -104,7 +105,10 @@ use crate::composefs_consts::{
 use crate::parsers::bls_config::{BLSConfig, BLSConfigType, EFIKey};
 use crate::spec::BootloaderKind;
 use crate::task::Task;
-use crate::{bootc_composefs::repo::open_composefs_repo, store::Storage};
+use crate::{
+    bootc_composefs::repo::open_composefs_repo,
+    store::{ComposefsRepository, Storage},
+};
 use crate::{bootc_composefs::status::get_sorted_grub_uki_boot_entries, install::PostFetchState};
 use crate::{
     composefs_consts::{
@@ -138,12 +142,121 @@ const AUTH_EXT: &str = "auth";
 /// This is relative to the ESP
 pub(crate) const BOOTC_UKI_DIR: &str = "EFI/Linux/bootc";
 
+/// Directory (relative to the ESP) where systemd-stub looks for UKI addons that apply
+/// to *every* UKI, as opposed to addons scoped to a single UKI (which live alongside
+/// it under [`BOOTC_UKI_DIR`]). Unlike per-UKI addons, these aren't tied to a single
+/// deployment, so they're neither namespaced by deployment verity nor cleaned up by GC.
+///
+/// TODO: This directory is shared, unscoped machine state (any systemd-stub UKI on the
+/// ESP will load whatever's here), but we currently treat it like deployment-owned
+/// content: we blindly overwrite same-named files with no ownership tracking, we only
+/// (re)install addons on `install` (not on upgrade, see `uki_addons` being hardcoded to
+/// `None` for `BootSetupType::Upgrade` below), and GC never removes stale entries here.
+/// Before recommending this feature for real use we should track which files here are
+/// bootc-owned, reconcile that set on every upgrade (installing newly-selected addons,
+/// removing ones we own that are no longer selected/present), and decide/document how
+/// this interacts with deployment rollback (a global addon update isn't reverted by
+/// rolling back to an older deployment).
+pub(crate) const GLOBAL_UKI_ADDONS_DIR: &str = "loader/addons";
+
 #[derive(thiserror::Error, Debug)]
 #[error("The UKI has the wrong composefs= parameter (is '{actual}', should be '{expected}')")]
 pub(crate) struct UKIDigestMismatch {
     pub actual: String,
     pub expected: String,
     pub uki_name: Option<String>,
+}
+
+pub(crate) fn print_uki_dumpfile_diff(
+    mismatch: &UKIDigestMismatch,
+    repo: &ComposefsRepository,
+    fs: &FileSystem<Sha512HashValue>,
+) {
+    let dumpfile_name = mismatch
+        .uki_name
+        .as_ref()
+        .and_then(|x| x.strip_suffix(EFI_EXT).map(|x| format!("{x}.dump")));
+
+    let Some(dumpfile_name) = &dumpfile_name else {
+        return;
+    };
+
+    let Some(stored_content) = read_dumpfile_from_fs(fs, dumpfile_name, repo) else {
+        tracing::debug!("Dumpfile {dumpfile_name} not found in filesystem");
+        return;
+    };
+
+    let Ok(tempdir) = tempfile::tempdir() else {
+        tracing::debug!("Creating tempdir failed");
+        return;
+    };
+    let path = tempdir.path();
+    let Ok(tempdir_cap) = Dir::open_ambient_dir(path, ambient_authority()) else {
+        tracing::debug!("Opening tempdir failed");
+        return;
+    };
+
+    let Ok(mut stored_file) = tempdir_cap.create("stored") else {
+        tracing::debug!("Creating 'stored' tmpfile failed");
+        return;
+    };
+    if stored_file.write_all(&stored_content).is_err() {
+        tracing::debug!("Writing to tmpfile failed");
+        return;
+    }
+
+    let Ok(mut current_file) = tempdir_cap.create("current") else {
+        tracing::debug!("Creating 'current' tmpfile failed");
+        return;
+    };
+    if let Err(e) = dumpfile::write_dumpfile(&mut current_file, fs) {
+        tracing::debug!("Writing dumpfile failed: {e}");
+        return;
+    }
+
+    let mut cmd = std::process::Command::new("diff");
+    cmd.arg("--color=auto")
+        .arg(format!("{}/stored", path.display()))
+        .arg(format!("{}/current", path.display()));
+
+    // Redirect stdout to stderr since this is diagnostic output
+    if let Ok(fd) = std::io::stderr().as_fd().try_clone_to_owned() {
+        cmd.stdout(fd);
+    }
+
+    if let Err(e) = cmd.status() {
+        tracing::warn!("diffing dumpfiles failed with Err: {e:?}");
+    }
+}
+
+fn read_regular_file(
+    file: &RegularFile<Sha512HashValue>,
+    repo: &ComposefsRepository,
+) -> Option<Vec<u8>> {
+    match file {
+        RegularFile::External(object_id, _) | RegularFile::ExternalNoVerity(object_id, _) => {
+            repo.read_object(object_id).ok()
+        }
+        RegularFile::Inline(data) => Some(data.to_vec()),
+        RegularFile::Sparse(_) => None,
+    }
+}
+
+fn read_dumpfile_from_fs(
+    fs: &FileSystem<Sha512HashValue>,
+    dumpfile_name: &str,
+    repo: &ComposefsRepository,
+) -> Option<Vec<u8>> {
+    let root = fs.as_dir();
+    let dumpfile_os = std::ffi::OsStr::new(dumpfile_name);
+
+    if let Ok(boot_dir) = root.get_directory_ref("boot".as_ref()) {
+        if let Ok(file) = boot_dir.get_file(dumpfile_os) {
+            return read_regular_file(file, repo);
+        }
+    }
+
+    None
 }
 
 pub(crate) enum BootSetupType<'a> {
@@ -867,6 +980,41 @@ struct UKIInfo {
     boot_digest: String,
 }
 
+/// Determines the directory (under `mounted_efi`) that a PE binary should be written to.
+///
+/// - A UKI, or an addon scoped to a single UKI, is namespaced under [`BOOTC_UKI_DIR`] by
+///   the deployment's verity digest, so it doesn't collide with other deployments.
+/// - A global UKI addon applies to every UKI, so it's written to the shared
+///   [`GLOBAL_UKI_ADDONS_DIR`] instead.
+fn pe_output_dir(
+    pe_type: &PEType,
+    mounted_efi: &Path,
+    file_path: &Utf8Path,
+    uki_id: &Sha512HashValue,
+) -> std::path::PathBuf {
+    if matches!(pe_type, PEType::GlobalUkiAddon) {
+        return mounted_efi.join(GLOBAL_UKI_ADDONS_DIR);
+    }
+
+    let efi_linux_path = mounted_efi.join(BOOTC_UKI_DIR);
+
+    match file_path.parent() {
+        Some(parent) if parent.as_str().ends_with(EFI_ADDON_DIR_EXT) => {
+            let dir_name = get_uki_addon_dir_name(&uki_id.to_hex());
+            let renamed_path = parent
+                .parent()
+                .map(|p| p.join(&dir_name))
+                .unwrap_or(dir_name.into());
+
+            efi_linux_path.join(renamed_path)
+        }
+
+        Some(parent) => efi_linux_path.join(parent),
+
+        None => efi_linux_path,
+    }
+}
+
 /// Writes a PortableExecutable to ESP along with any PE specific or Global addons
 #[context("Writing {file_path} to ESP")]
 fn write_pe_to_esp(
@@ -949,39 +1097,15 @@ fn write_pe_to_esp(
         });
     }
 
-    let efi_linux_path = mounted_efi.as_ref().join(BOOTC_UKI_DIR);
-    create_dir_all(&efi_linux_path).context("Creating bootc UKI directory")?;
-
-    let final_pe_path = match file_path.parent() {
-        Some(parent) => {
-            let renamed_path = match parent.as_str().ends_with(EFI_ADDON_DIR_EXT) {
-                true => {
-                    let dir_name = get_uki_addon_dir_name(&uki_id.to_hex());
-
-                    parent
-                        .parent()
-                        .map(|p| p.join(&dir_name))
-                        .unwrap_or(dir_name.into())
-                }
-
-                false => parent.to_path_buf(),
-            };
-
-            let full_path = efi_linux_path.join(renamed_path);
-            create_dir_all(&full_path)?;
-
-            full_path
-        }
-
-        None => efi_linux_path,
-    };
+    let final_pe_path = pe_output_dir(&pe_type, mounted_efi.as_ref(), file_path, uki_id);
+    create_dir_all(&final_pe_path).with_context(|| format!("Creating {final_pe_path:?}"))?;
 
     let pe_dir = Dir::open_ambient_dir(&final_pe_path, ambient_authority())
         .with_context(|| format!("Opening {final_pe_path:?}"))?;
 
     let pe_name = match pe_type {
         PEType::Uki => &get_uki_name(&uki_id.to_hex()),
-        PEType::UkiAddon => file_path
+        PEType::UkiAddon | PEType::GlobalUkiAddon => file_path
             .components()
             .last()
             .ok_or_else(|| anyhow::anyhow!("Failed to get UKI Addon file name"))?
@@ -1197,6 +1321,10 @@ pub(crate) fn setup_composefs_uki_boot(
                 esp_dev.path(),
                 bootloader,
                 booted_cfs.cmdline.allow_missing_fsverity,
+                // TODO: We never (re)install UKI addons on upgrade, only on initial
+                // `install`. This is especially relevant for global addons (see the
+                // TODO on `GLOBAL_UKI_ADDONS_DIR`): if a newer image changes or drops
+                // one, the ESP copy is never reconciled.
                 None,
             )
         }
@@ -1214,8 +1342,9 @@ pub(crate) fn setup_composefs_uki_boot(
             }
 
             ComposefsBootEntry::Type2(entry) => {
-                // If --uki-addon is not passed, we don't install any addon
-                if matches!(entry.pe_type, PEType::UkiAddon) {
+                // If --uki-addon is not passed, we don't install any addon (whether
+                // it's scoped to this UKI or a global one)
+                if matches!(entry.pe_type, PEType::UkiAddon | PEType::GlobalUkiAddon) {
                     let Some(addons) = uki_addons else {
                         continue;
                     };
@@ -1501,7 +1630,7 @@ pub(crate) async fn setup_composefs_boot(
     let fs = composefs_oci::image::create_filesystem(
         &*repo,
         &pull_result.config_digest,
-        None,
+        Some(&pull_result.config_verity),
         &Default::default(),
     )
     .context("Creating composefs filesystem for boot entry discovery")?;
@@ -1633,64 +1762,7 @@ pub(crate) async fn setup_composefs_boot(
                 Ok(boot_digest) => boot_digest,
                 Err(e) => match e.downcast::<UKIDigestMismatch>() {
                     Ok(mismatch) => {
-                        // We expect the dumpfile to be named the same as the UKI
-                        // Ex. UKI      - 6.19.14-108.fc42.x86_64.efi
-                        //     Dumpfile - 6.19.14-108.fc42.x86_64.dump
-                        let dumpfile_name = mismatch
-                            .uki_name
-                            .as_ref()
-                            .and_then(|x| x.strip_suffix(EFI_EXT).map(|x| format!("{x}.dump")));
-
-                        let Some(dumpfile_name) = &dumpfile_name else {
-                            return Err(mismatch.into());
-                        };
-
-                        let dump = composefs_ctl::dump_files(
-                            &repo,
-                            &id.to_hex(),
-                            &vec![PathBuf::from(dumpfile_name)],
-                            true,
-                        );
-
-                        let Ok(dump) = dump else {
-                            tracing::debug!("Dumpfile not found for diff");
-                            return Err(mismatch.into());
-                        };
-
-                        // SAFETY: This output is always UTF-8 compatible as it's of the form
-                        // <file-name> <object-path>
-                        let text = std::str::from_utf8(&dump)?;
-                        let obj_path = text.split_whitespace().nth(1);
-
-                        let Some(obj_path) = obj_path else {
-                            return Err(mismatch.into());
-                        };
-
-                        let tempdir = tempfile::tempdir()?;
-                        let path = tempdir.path();
-                        let tempdir = Dir::open_ambient_dir(path, ambient_authority())?;
-
-                        let mut tmpfile = tempdir.create("current")?;
-                        dumpfile::write_dumpfile(&mut tmpfile, &fs).context("Writing dumpfile")?;
-
-                        let mut cmd = std::process::Command::new("diff");
-                        let out = cmd
-                            .arg("--color=auto")
-                            .arg(
-                                root_setup
-                                    .physical_root_path
-                                    .join("sysroot/composefs/objects")
-                                    .join(obj_path),
-                            )
-                            .arg(format!("{}/current", path.display()))
-                            .status();
-
-                        // Intentionally not short-circuiting here as the real error is digest
-                        // mismtach
-                        if let Err(e) = out {
-                            tracing::warn!("diffing dumpfiles failed with Err: {e:?}");
-                        };
-
+                        print_uki_dumpfile_diff(&mismatch, &repo, &fs);
                         return Err(mismatch.into());
                     }
                     Err(e) => Err(e)?,
@@ -1717,6 +1789,48 @@ pub(crate) async fn setup_composefs_boot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pe_output_dir() {
+        let mounted_efi = Path::new("/esp");
+        let uki_id = Sha512HashValue::EMPTY;
+        let uki_hex = uki_id.to_hex();
+
+        // Boot entry paths are relative to the directory they were discovered in
+        // (e.g. "/boot/EFI/Linux" or "/boot/loader/addons"), not absolute filesystem paths.
+
+        // A UKI itself always lands directly in BOOTC_UKI_DIR.
+        assert_eq!(
+            pe_output_dir(&PEType::Uki, mounted_efi, Utf8Path::new("foo.efi"), &uki_id),
+            mounted_efi.join(BOOTC_UKI_DIR)
+        );
+
+        // A per-UKI addon (nested under a `<name>.efi.extra.d` directory) gets
+        // renamed into a directory namespaced by the UKI's verity digest.
+        assert_eq!(
+            pe_output_dir(
+                &PEType::UkiAddon,
+                mounted_efi,
+                Utf8Path::new("foo.efi.extra.d/bar.addon.efi"),
+                &uki_id
+            ),
+            mounted_efi
+                .join(BOOTC_UKI_DIR)
+                .join(get_uki_addon_dir_name(&uki_hex))
+        );
+
+        // A global UKI addon is written to the shared addons directory, not
+        // namespaced by any particular UKI's verity digest.
+        assert_eq!(
+            pe_output_dir(
+                &PEType::GlobalUkiAddon,
+                mounted_efi,
+                Utf8Path::new("bar.addon.efi"),
+                &uki_id
+            ),
+            mounted_efi.join(GLOBAL_UKI_ADDONS_DIR)
+        );
+    }
 
     #[test]
     fn test_type1_filename_generation() {

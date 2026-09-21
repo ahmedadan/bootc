@@ -109,8 +109,9 @@ cp /sysroot/etc/sysconfig/network-scripts/ifcfg-eth0 /etc/sysconfig/network-scri
 # Copy application configuration
 cp -r /sysroot/etc/myapp /etc/
 
-# Selectively merge configuration files
-vi /etc/resolv.conf  # Add nameservers from /sysroot/etc/resolv.conf
+# Identify the old resolver policy, then migrate its authoritative
+# network manager profiles or resolver configuration
+stat -c '%F %N' /sysroot/etc/resolv.conf
 
 # For user accounts, use proper tools
 vipw  # Carefully review and merge users from /sysroot/etc/passwd
@@ -119,6 +120,15 @@ vipw  # Carefully review and merge users from /sysroot/etc/passwd
 This applies to network configurations, user accounts, application settings,
 and other system configuration stored in `/etc`. Review files in `/sysroot/etc`
 and manually copy or merge what you need into `/etc`.
+
+**Note:** A generated `/etc/resolv.conf` should not normally be copied or
+edited directly. It may be a dangling symlink after reboot or contain only a
+local resolver address such as `127.0.0.53`, rather than the upstream DNS
+servers. Migrate the authoritative configuration, such as NetworkManager
+connection profiles or resolver drop-ins, into the configuration used by the
+new system. If both systems intentionally use a hand-managed static file, it
+may instead be selectively migrated. See
+[DNS and `/etc/resolv.conf`](../building/dns.md) for details.
 
 **Note:** For filesystem mounts from `/etc/fstab` in the old system, consider
 using kernel arguments (via `systemd.mount-extra`) injected before reboot instead
@@ -245,4 +255,3 @@ of migrating the fstab entries. See the "Injecting kernel arguments" section abo
 # VERSION
 
 <!-- VERSION PLACEHOLDER -->
-

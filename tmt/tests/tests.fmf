@@ -41,6 +41,10 @@ check:
 /test-24-image-upgrade-reboot:
   summary: Execute local upgrade tests
   duration: 30m
+  adjust:
+  - when: distro == centos-9 and boot_type == uki and seal_state == sealed
+    enabled: false
+    because: CentOS 9 cannot consume the signed host upgrade because shared storage is unavailable and its guest-local UKI builder produces unsigned images
   test: nu booted/test-image-upgrade-reboot.nu
 
 /test-25-soft-reboot:
@@ -174,17 +178,22 @@ check:
   duration: 30m
   test: nu booted/test-44-shadow-fixup.nu
 
-/test-45-composefs-corruped-state-resilience:
+/test-45-composefs-corrupted-state-resilience:
   summary: Test composefs backend resilience to state corruption
   duration: 30m
-  test: nu booted/test-composefs-corruped-state-resilience.nu
+  test: nu booted/test-composefs-corrupted-state-resilience.nu
 
 /test-46-etc-merge-conflict:
   summary: Verify etc merge conflicts are caught during upgrade, not finalization
   duration: 15m
   test: nu booted/test-etc-merge-conflict.nu
 
+/test-47-download-only-switch:
+  summary: Execute download-only switch tests
+  duration: 40m
+  test: nu booted/test-download-only-switch.nu
+
 /test-48-composefs-uki-dumpfile:
-  summary: Test composefs garbage collection for UKI
+  summary: Test composefs UKI dumpfile diff print
   duration: 30m
   test: nu booted/test-composefs-uki-dumpfile.nu

@@ -14,6 +14,11 @@ The second, and most important mode of operation is when a bootc container is in
 
 Crucially, besides setting up some mounts, bootc itself does not act as any kind of "container runtime".  It does not set up pid or other namespace, does not change cgroups, etc.  That remains the role of other code (typically systemd).  `bootc` is not a persistent daemon by default; it does not impose any runtime overhead.
 
+This distinction also applies to DNS configuration. A container runtime may
+inject `/etc/resolv.conf` while building or running a container, but it is not
+present to do so after a bootc image boots. See
+[DNS and `/etc/resolv.conf`](dns.md).
+
 Another example of this: While one can add [Container configuration](https://github.com/opencontainers/image-spec/blob/main/config.md) metadata, `bootc` generally ignores that at runtime today.
 
 ## Labels
@@ -88,4 +93,3 @@ system is deployed.
 
 For more on the intersection of SELinux and current bootc (OSTree container)
 images, see [bootc images - SELinux](../bootc-images.md#SELinux).
-

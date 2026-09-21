@@ -2,6 +2,8 @@
 # tmt:
 #   summary: Error on bootc switch to image with identical fs-verity digest
 #   duration: 10m
+# extra:
+#   skip_if_ostree: true
 #
 # Verify that `bootc switch` errors out when the target image produces the
 # same composefs fs-verity digest as an existing deployment.  The simplest
@@ -9,10 +11,6 @@
 # same local image under a second name.
 use std assert
 use tap.nu
-
-if not (tap is_composefs) {
-    exit 0
-}
 
 tap begin "bootc switch to same-digest image must error"
 

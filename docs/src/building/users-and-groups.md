@@ -149,6 +149,45 @@ writing there is no command line to do so though).
 Typically it is more preferable to use `sysusers.d`
 or `DynamicUser=yes`.
 
+##### Modifying or adding members to system groups
+
+`groupmod`, `gpasswd`, and `libuser`'s `lgroupadd` operate on `/etc/group`.
+Many system groups also have an entry there (for example `wheel`) and are
+managed normally. But some — typically hardware/device groups such as `cdrom`
+or `dialout` — exist *only* in `/usr/lib/group`. Such a group resolves through
+`getent group` yet is absent from `/etc/group`, so these tools fail or
+silently do nothing:
+
+- `groupmod -g <gid> cdrom` reports `group 'cdrom' does not exist in
+  /etc/group`.
+- `gpasswd -a <user> cdrom` and `lgroupadd` report the group does not exist
+  in `/etc/group`.
+- `usermod -aG cdrom <user>` exits `0` but does **not** add the member.
+
+This is expected behavior of the split, not a bug. Check where a group lives
+before managing it:
+
+```console
+$ grep '^cdrom:' /etc/group    # no output => the group is only in /usr/lib/group
+$ getent group cdrom           # still resolves, via nss-altfiles
+```
+
+For a group that exists only in `/usr/lib/group`, add its line to `/etc/group`
+(writable machine-local state) first, then manage it normally:
+
+```console
+$ getent group cdrom >> /etc/group
+$ gpasswd -a <user> cdrom
+```
+
+Do **not** do this for a group that is already in `/etc/group` (such as
+`wheel`): a duplicate entry breaks these tools (`Multiple entries named
+'wheel' in /etc/group`). The membership added this way is machine-local; to
+make it part of the image instead, add it as image content (a `sysusers.d`
+`m <user> <group>` line, or by editing `/usr/lib/group` in the build). To
+change a system group's GID, see
+[Reusing a UID/GID reserved by the base image](#reusing-a-uidgid-reserved-by-the-base-image).
+
 ### Machine-local state for users
 
 At this point, it is important to understand the [filesystem](../filesystem.md)
@@ -244,6 +283,78 @@ This can be a problem if that user maintains persistent state.
 Such cases are best handled by being converted to use `sysusers.d`
 (see [Fedora change](https://fedoraproject.org/wiki/Changes/Adopting_sysusers.d_format)) - or again even better, using `DynamicUser=yes` (see above).
 
+### Reusing a UID/GID reserved by the base image
+
+Sometimes a local group or an application needs a specific numeric GID (or
+UID) that a package in the base image already reserves. For example a fleet
+has historically used GID `17` for a `developers` group, but the base image
+ships a system group on GID `17`.
+
+The obvious commands fail. `groupadd -g 17 developers` reports `GID '17'
+already exists`, because the base group is a "system" entry served by
+[nss-altfiles](#nss-altfiles) from `/usr/lib/group` and answers the lookup for
+that GID; and `groupmod`/`gpasswd` cannot edit it there (see
+[Modifying or adding members to system groups](#modifying-or-adding-members-to-system-groups)).
+`systemd-sysusers` will not force an already-used GID either; given a conflict
+it allocates a different one.
+
+You do **not** need to remove the package that owns the group. There are two
+supported approaches.
+
+#### Prefer a non-conflicting GID
+
+If the application refers to the group **by name**, the numeric value does not
+matter to it; give the local group any free GID. Numbers below the
+distribution's `SYS_GID_MAX` (see `/etc/login.defs`) are reserved for system
+allocation, so choose from the free range and allocate it statically, e.g. via
+[`sysusers.d`](#using-systemd-sysusers) or by appending to `/usr/lib/group`.
+`getent group <gid>` on the base image confirms whether a number is free.
+
+This avoids changing anything in the base image and is the right choice
+whenever the specific number is not an external requirement.
+
+#### Reassigning the base group's GID
+
+When a specific reserved number really must be reused (a legacy assignment
+already baked into a fleet's file ownership, for instance), reassign the base
+group to a different free GID in your derived build. This is a configuration
+change, not a package removal, and it must happen at build time — before the
+allocation reaches a running machine's files. The group is defined in two
+places that both have to agree:
+
+```Dockerfile
+FROM <base image>
+RUN set -xeu; \
+    # 1. move the base group off the wanted GID in the altfiles source
+    sed -i 's/^cdrom:x:17:/cdrom:x:4711:/' /usr/lib/group; \
+    # 2. keep systemd-sysusers consistent: a lexically-earlier drop-in wins
+    #    over the base package's entry, so it will not try to recreate the
+    #    group on the old GID at boot
+    printf 'g cdrom 4711\n' > /usr/lib/sysusers.d/00-reassign-cdrom.conf; \
+    # 3. allocate the local group at the now-free GID, statically in the image
+    echo 'developers:x:17:' >> /usr/lib/group; \
+    bootc container lint
+```
+
+`cdrom`, `17`, and `developers` are placeholders: substitute the group that
+actually holds the GID (`getent group <gid>` names it), the GID you need, and a
+free replacement GID from the reserved range. Note that on many bases `cdrom`
+is a different GID, so the `sed` above matches nothing unless adapted.
+
+Editing `/usr/lib/group` is necessary because altfiles keeps answering for the
+old GID otherwise; the `sysusers.d` drop-in alone is not enough, and
+`sysusers.d` alone cannot move an existing entry.
+
+After this, `getent group 17` resolves to `developers`, the base group exists
+on its new GID, and the mapping survives reboots and the `/etc` three-way
+merge. Everything that referenced the base group **by name** continues to work
+because name resolution stays consistent; only code that hardcodes the old
+numeric GID would be affected, which is unusual.
+
+Note that adding members to a group that lives in `/usr/lib/group` (such as the
+reassigned base group) is itself an altfiles behavior: `gpasswd`/`usermod -aG`
+operate on `/etc/group`, so promote the group's line into `/etc/group` first,
+or manage the membership as image content.
 
 #### tmpfiles.d use for setting ownership
 

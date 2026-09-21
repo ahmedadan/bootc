@@ -117,6 +117,10 @@ make in the container image to e.g. `/etc/postgresql.conf`
 will be applied on update, assuming it is not modified
 locally.
 
+Resolver configuration has an additional interaction with the container
+runtime used to build the image. See
+[DNS and `/etc/resolv.conf`](dns.md) for the recommended approach.
+
 ### Prefer using drop-in directories
 
 These "locally modified" files can be a source of state drift.  The best

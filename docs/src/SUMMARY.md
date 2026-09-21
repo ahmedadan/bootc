@@ -10,6 +10,7 @@
 
 - [Building images](building/guidance.md)
 - [Container runtime vs bootc runtime](building/bootc-runtime.md)
+- [DNS and resolv.conf](building/dns.md)
 - [Users, groups, SSH keys](building/users-and-groups.md)
 - [Kernel arguments](building/kernel-arguments.md)
 - [Secrets](building/secrets.md)
@@ -22,6 +23,7 @@
 - [Accessing registries and offline updates](registries-and-offline.md)
 - [Logically bound images](logically-bound-images.md)
 - [Booting local builds](booting-local-builds.md)
+- [Managing the initramfs after installation](initramfs.md)
 - [`man bootc`](man/bootc.8.md)
 - [`man bootc-status`](man/bootc-status.8.md)
 - [`man bootc-upgrade`](man/bootc-upgrade.8.md)
@@ -55,6 +57,7 @@
 - [Filesystem: sysroot](filesystem-sysroot.md)
 - [Container storage](filesystem-storage.md)
 - [Bootloader](bootloaders.md)
+- [Disk encryption (e.g. LUKS)](filesystem-encryption.md)
 
 # Security
 

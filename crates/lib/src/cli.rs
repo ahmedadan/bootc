@@ -62,7 +62,7 @@ use crate::utils::sigpolicy_from_opt;
 use crate::{bootc_composefs, lints};
 
 /// Shared progress options
-#[derive(Debug, Parser, PartialEq, Eq)]
+#[derive(Clone, Debug, Parser, PartialEq, Eq)]
 pub(crate) struct ProgressOptions {
     /// File descriptor number which must refer to an open pipe.
     ///
@@ -84,6 +84,25 @@ impl TryFrom<ProgressOptions> for ProgressWriter {
     }
 }
 
+#[derive(Debug, Parser, PartialEq, Eq)]
+pub(crate) struct DownloadOnlyOpts {
+    /// Download and stage the update without applying it.
+    ///
+    /// Download the image and ensure it's retained on disk for the lifetime of this system boot,
+    /// but it will not be applied on reboot. If the system is rebooted without applying the update,
+    /// the image will be eligible for garbage collection again.
+    #[clap(long, conflicts_with = "apply")]
+    pub(crate) download_only: bool,
+
+    /// Apply a staged deployment that was previously downloaded with --download-only.
+    ///
+    /// This unlocks the staged deployment without fetching updates from the container image source.
+    /// The deployment will be applied on the next shutdown or reboot. Use with --apply to
+    /// reboot immediately.
+    #[clap(long, conflicts_with = "download_only")]
+    pub(crate) from_downloaded: bool,
+}
+
 /// Perform an upgrade operation
 #[derive(Debug, Parser, PartialEq, Eq)]
 pub(crate) struct UpgradeOpts {
@@ -94,7 +113,7 @@ pub(crate) struct UpgradeOpts {
     /// Check if an update is available without applying it.
     ///
     /// This only downloads updated metadata, not the full image layers.
-    #[clap(long, conflicts_with = "apply")]
+    #[clap(long, conflicts_with_all = ["apply", "download_only", "from_downloaded"])]
     pub(crate) check: bool,
 
     /// Restart or reboot into the new target image.
@@ -109,21 +128,8 @@ pub(crate) struct UpgradeOpts {
     #[clap(long = "soft-reboot", conflicts_with = "check")]
     pub(crate) soft_reboot: Option<SoftRebootMode>,
 
-    /// Download and stage the update without applying it.
-    ///
-    /// Download the update and ensure it's retained on disk for the lifetime of this system boot,
-    /// but it will not be applied on reboot. If the system is rebooted without applying the update,
-    /// the image will be eligible for garbage collection again.
-    #[clap(long, conflicts_with_all = ["check", "apply"])]
-    pub(crate) download_only: bool,
-
-    /// Apply a staged deployment that was previously downloaded with --download-only.
-    ///
-    /// This unlocks the staged deployment without fetching updates from the container image source.
-    /// The deployment will be applied on the next shutdown or reboot. Use with --apply to
-    /// reboot immediately.
-    #[clap(long, conflicts_with_all = ["check", "download_only"])]
-    pub(crate) from_downloaded: bool,
+    #[clap(flatten)]
+    pub(crate) download_opts: DownloadOnlyOpts,
 
     /// Upgrade to a different tag of the currently booted image.
     ///
@@ -159,6 +165,9 @@ pub(crate) struct SwitchOpts {
     #[clap(long, default_value = "registry")]
     pub(crate) transport: String,
 
+    #[clap(flatten)]
+    pub(crate) download_opts: DownloadOnlyOpts,
+
     /// This argument is deprecated and does nothing.
     #[clap(long, hide = true)]
     pub(crate) no_signature_verification: bool,
@@ -191,7 +200,12 @@ pub(crate) struct SwitchOpts {
     pub(crate) unified_storage_exp: bool,
 
     /// Target image to use for the next boot.
-    pub(crate) target: String,
+    /// Required unless `--from-downloaded` is present.
+    #[clap(
+        required_unless_present = "from_downloaded",
+        conflicts_with = "from_downloaded"
+    )]
+    pub(crate) target: Option<String>,
 
     #[clap(flatten)]
     pub(crate) progress: ProgressOptions,
@@ -494,13 +508,23 @@ pub(crate) enum ContainerOpts {
         #[clap(long)]
         kernel_in_boot: bool,
 
-        /// Disable SELinux labeling in the exported archive.
-        #[clap(long)]
-        disable_selinux: bool,
+        /// SELinux labeling mode for exported entries.
+        #[clap(long, default_value = "enabled")]
+        selinux: ExportSelinuxMode,
 
         /// Path to the container filesystem root
         target: Utf8PathBuf,
     },
+}
+
+#[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
+pub(crate) enum ExportSelinuxMode {
+    /// Compute and apply SELinux labels; error if any file has no policy match.
+    Enabled,
+    /// Compute and apply SELinux labels; warn (don't error) for files with no policy match.
+    WarnOnMissing,
+    /// Do not apply SELinux labels.
+    Disabled,
 }
 
 #[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
@@ -658,6 +682,26 @@ pub(crate) enum UkiSubcommands {
     },
 }
 
+/// Subcommands for `bootc internals selinux`.
+#[derive(Debug, clap::Subcommand, PartialEq, Eq)]
+pub(crate) enum SelinuxOpts {
+    /// Exit successfully when PATH is unlabeled; otherwise exit with status 1.
+    IsUnlabeled {
+        /// Absolute path to inspect without following a final symbolic link.
+        #[arg(value_parser = parse_absolute_path)]
+        path: Utf8PathBuf,
+    },
+}
+
+fn parse_absolute_path(value: &str) -> std::result::Result<Utf8PathBuf, String> {
+    let path = Utf8PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err("path must be absolute".to_string())
+    }
+}
+
 /// Hidden, internal only options
 #[derive(Debug, clap::Subcommand, PartialEq, Eq)]
 pub(crate) enum InternalsOpts {
@@ -679,6 +723,8 @@ pub(crate) enum InternalsOpts {
     },
     #[clap(subcommand)]
     Fsverity(FsverityOpts),
+    #[clap(subcommand)]
+    Selinux(SelinuxOpts),
     /// Perform consistency checking.
     Fsck,
     /// Perform cleanup actions
@@ -1021,7 +1067,14 @@ pub(crate) fn ensure_self_unshared_mount_namespace() -> Result<()> {
             anyhow::bail!("Failed to unshare mount namespace");
         }
     }
-    bootc_utils::reexec::reexec_with_guardenv(recurse_env, &["unshare", "-m", "--"])
+
+    // Pass --propagation=slave so that if systemd gpt-auto-generator has
+    // automount for /boot it gets propagated inside the new mount ns
+    // for us to be able to access the /boot mount even if it's expired
+    bootc_utils::reexec::reexec_with_guardenv(
+        recurse_env,
+        &["unshare", "-m", "--propagation=slave", "--"],
+    )
 }
 
 /// Load global storage state, expecting that we're booted into a bootc system.
@@ -1179,11 +1232,42 @@ pub(crate) fn prepare_for_write() -> Result<()> {
     }
     crate::cli::require_root(false)?;
     ensure_self_unshared_mount_namespace()?;
-    if crate::lsm::selinux_enabled()? && !crate::lsm::selinux_ensure_install()? {
+    if crate::lsm::selinux_enabled() && !crate::lsm::selinux_ensure_install()? {
         tracing::debug!("Do not have install_t capabilities");
     }
     ENTERED.store(true, Ordering::SeqCst);
     Ok(())
+}
+
+struct ApplyFromDownloadedOpts {
+    soft_reboot: Option<SoftRebootMode>,
+    apply: bool,
+}
+
+async fn apply_from_downloaded_ostree(
+    storage: &Storage,
+    booted_ostree: &BootedOstree<'_>,
+    host: &crate::spec::Host,
+    opts: &ApplyFromDownloadedOpts,
+) -> Result<()> {
+    let ostree = storage.get_ostree()?;
+    let staged_deployment = ostree
+        .staged_deployment()
+        .ok_or_else(|| anyhow::anyhow!("No staged deployment found"))?;
+
+    if staged_deployment.is_finalization_locked() {
+        crate::boundimage::pull_bound_images(storage, &staged_deployment).await?;
+        ostree.change_finalization(&staged_deployment)?;
+        println!("Staged deployment will now be applied on reboot");
+    } else {
+        println!("Staged deployment is already set to apply on reboot");
+    }
+
+    handle_staged_soft_reboot(booted_ostree, opts.soft_reboot, &host)?;
+    if opts.apply {
+        crate::reboot::reboot()?;
+    }
+    return Ok(());
 }
 
 /// Implementation of the `bootc upgrade` CLI command.
@@ -1240,24 +1324,17 @@ async fn upgrade(
     let mut changed = false;
 
     // Handle --from-downloaded: unlock existing staged deployment without fetching from image source
-    if opts.from_downloaded {
-        let ostree = storage.get_ostree()?;
-        let staged_deployment = ostree
-            .staged_deployment()
-            .ok_or_else(|| anyhow::anyhow!("No staged deployment found"))?;
-
-        if staged_deployment.is_finalization_locked() {
-            ostree.change_finalization(&staged_deployment)?;
-            println!("Staged deployment will now be applied on reboot");
-        } else {
-            println!("Staged deployment is already set to apply on reboot");
-        }
-
-        handle_staged_soft_reboot(booted_ostree, opts.soft_reboot, &host)?;
-        if opts.apply {
-            crate::reboot::reboot()?;
-        }
-        return Ok(());
+    if opts.download_opts.from_downloaded {
+        return apply_from_downloaded_ostree(
+            storage,
+            booted_ostree,
+            &host,
+            &ApplyFromDownloadedOpts {
+                soft_reboot: opts.soft_reboot,
+                apply: opts.apply,
+            },
+        )
+        .await;
     }
 
     // Ensure the bootc storage directory is initialized; the --check path
@@ -1330,7 +1407,7 @@ async fn upgrade(
 
             if let Some(staged) = staged_deployment {
                 // Handle download-only mode based on flags
-                if opts.download_only {
+                if opts.download_opts.download_only {
                     // --download-only: set download-only mode
                     if !staged.is_finalization_locked() {
                         storage.get_ostree()?.change_finalization(&staged)?;
@@ -1346,7 +1423,7 @@ async fn upgrade(
                         download_only_changed = true;
                     }
                 }
-            } else if opts.download_only || opts.apply {
+            } else if opts.download_opts.download_only || opts.apply {
                 anyhow::bail!("No staged deployment found");
             }
 
@@ -1369,7 +1446,7 @@ async fn upgrade(
                 &fetched,
                 &spec,
                 prog.clone(),
-                opts.download_only,
+                opts.download_opts.download_only,
             )
             .await?;
             changed = true;
@@ -1401,11 +1478,17 @@ async fn upgrade(
 
     Ok(())
 }
+
+#[context("Getting imgref for switch")]
 pub(crate) fn imgref_for_switch(opts: &SwitchOpts) -> Result<ImageReference> {
     let transport = ostree_container::Transport::try_from(opts.transport.as_str())?;
     let imgref = ostree_container::ImageReference {
         transport,
-        name: opts.target.to_string(),
+        name: opts
+            .target
+            .as_ref()
+            .ok_or_else(|| anyhow!("Target image not found"))?
+            .to_string(),
     };
     let sigverify = sigpolicy_from_opt(opts.enforce_container_sigpolicy);
     let target = ostree_container::OstreeImageReference { sigverify, imgref };
@@ -1421,12 +1504,26 @@ async fn switch_ostree(
     storage: &Storage,
     booted_ostree: &BootedOstree<'_>,
 ) -> Result<()> {
+    let (_, host) = crate::status::get_status(booted_ostree)?;
+
+    if opts.download_opts.from_downloaded {
+        return apply_from_downloaded_ostree(
+            storage,
+            booted_ostree,
+            &host,
+            &ApplyFromDownloadedOpts {
+                soft_reboot: opts.soft_reboot,
+                apply: opts.apply,
+            },
+        )
+        .await;
+    }
+
     let target = imgref_for_switch(&opts)?;
     let prog: ProgressWriter = opts.progress.try_into()?;
     let cancellable = gio::Cancellable::NONE;
 
     let repo = &booted_ostree.repo();
-    let (_, host) = crate::status::get_status(booted_ostree)?;
 
     let new_spec = {
         let mut new_spec = host.spec.clone();
@@ -1508,9 +1605,21 @@ async fn switch_ostree(
 
     let stateroot = booted_ostree.stateroot();
     let from = MergeState::from_stateroot(storage, &stateroot)?;
-    crate::deploy::stage(storage, from, &fetched, &new_spec, prog.clone(), false).await?;
+    crate::deploy::stage(
+        storage,
+        from,
+        &fetched,
+        &new_spec,
+        prog.clone(),
+        opts.download_opts.download_only,
+    )
+    .await?;
 
     storage.update_mtime()?;
+
+    if opts.download_opts.download_only {
+        return Ok(());
+    }
 
     if opts.soft_reboot.is_some() {
         // At this point we have staged the deployment and the host definition has changed.
@@ -1519,6 +1628,8 @@ async fn switch_ostree(
         handle_staged_soft_reboot(booted_ostree, opts.soft_reboot, &updated_host)?;
     }
 
+    // `--apply` cannot be passed along with `--download-only` (handled by clap)
+    // but for sanity nonetheless
     if opts.apply {
         crate::reboot::reboot()?;
     }
@@ -1745,9 +1856,29 @@ pub fn global_init() -> Result<()> {
     Ok(())
 }
 
+/// The outcome of executing the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliExitStatus {
+    Success,
+    PredicateFalse,
+}
+
+fn is_unlabeled_exit_status(
+    state: crate::lsm::SELinuxLabelState,
+    path: &Utf8Path,
+) -> Result<CliExitStatus> {
+    match state {
+        crate::lsm::SELinuxLabelState::Unlabeled => Ok(CliExitStatus::Success),
+        crate::lsm::SELinuxLabelState::Labeled => Ok(CliExitStatus::PredicateFalse),
+        crate::lsm::SELinuxLabelState::Unsupported => {
+            anyhow::bail!("SELinux labeling is unsupported for {path}")
+        }
+    }
+}
+
 /// Parse the provided arguments and execute.
 /// Calls [`clap::Error::exit`] on failure, printing the error message and aborting the program.
-pub async fn run_from_iter<I>(args: I) -> Result<()>
+pub async fn run_from_iter<I>(args: I) -> Result<CliExitStatus>
 where
     I: IntoIterator,
     I::Item: Into<OsString> + Clone,
@@ -1802,9 +1933,9 @@ impl Opt {
 }
 
 /// Internal (non-generic/monomorphized) primary CLI entrypoint
-async fn run_from_opt(opt: Opt) -> Result<()> {
+async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
     let root = &Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
-    match opt {
+    let result = match opt {
         Opt::Upgrade(opts) => {
             let storage = &get_storage().await?;
             match storage.kind()? {
@@ -1853,7 +1984,8 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
                 no_truncate,
             } => {
                 if list {
-                    return lints::lint_list(std::io::stdout().lock());
+                    return lints::lint_list(std::io::stdout().lock())
+                        .map(|()| CliExitStatus::Success);
                 }
                 let warnings = if fatal_warnings {
                     lints::WarningDisposition::FatalWarnings
@@ -2026,14 +2158,14 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
                 target,
                 output,
                 kernel_in_boot,
-                disable_selinux,
+                selinux,
             } => {
                 crate::container_export::export(
                     &format,
                     &target,
                     output.as_deref(),
                     kernel_in_boot,
-                    disable_selinux,
+                    &selinux,
                 )
                 .await
             }
@@ -2212,6 +2344,21 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
                     Ok(())
                 }
             },
+            InternalsOpts::Selinux(SelinuxOpts::IsUnlabeled { path }) => {
+                ensure!(crate::lsm::selinux_enabled(), "SELinux is not enabled");
+                let path = path
+                    .strip_prefix("/")
+                    .expect("absolute paths have a root prefix");
+                match is_unlabeled_exit_status(
+                    crate::lsm::has_security_selinux(&root, path)?,
+                    path,
+                )? {
+                    CliExitStatus::Success => Ok(()),
+                    CliExitStatus::PredicateFalse => {
+                        return Ok(CliExitStatus::PredicateFalse);
+                    }
+                }
+            }
             InternalsOpts::Cfs { args } => composefs_ctl::run_from_iter(args.iter()).await,
             InternalsOpts::Reboot => crate::reboot::reboot(),
             InternalsOpts::Fsck => {
@@ -2324,7 +2471,7 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
 
                     BootedStorageKind::Composefs(booted_cfs) => {
                         if reset {
-                            return reset_soft_reboot();
+                            return reset_soft_reboot().map(|()| CliExitStatus::Success);
                         }
 
                         prepare_soft_reboot_composefs(
@@ -2489,7 +2636,8 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
                 }
             }
         }
-    }
+    };
+    result.map(|()| CliExitStatus::Success)
 }
 
 #[cfg(test)]
@@ -2586,6 +2734,51 @@ mod tests {
             Opt::parse_including_static(["bootc", "status", "-v"]),
             Opt::Status(StatusOpts { verbose: true, .. })
         ));
+    }
+
+    #[test]
+    fn test_parse_selinux_is_unlabeled() {
+        let opt = Opt::try_parse_from([
+            "bootc",
+            "internals",
+            "selinux",
+            "is-unlabeled",
+            "/var/lib/probe",
+        ])
+        .unwrap();
+        assert!(matches!(
+            opt,
+            Opt::Internals(InternalsOpts::Selinux(SelinuxOpts::IsUnlabeled { path }))
+                if path == "/var/lib/probe"
+        ));
+        assert!(
+            Opt::try_parse_from(["bootc", "internals", "selinux", "is-unlabeled", "relative",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_is_unlabeled_exit_status() {
+        let path = Utf8Path::new("probe");
+        let cases = [
+            (
+                crate::lsm::SELinuxLabelState::Unlabeled,
+                CliExitStatus::Success,
+            ),
+            (
+                crate::lsm::SELinuxLabelState::Labeled,
+                CliExitStatus::PredicateFalse,
+            ),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(is_unlabeled_exit_status(state, path).unwrap(), expected);
+        }
+        assert!(
+            is_unlabeled_exit_status(crate::lsm::SELinuxLabelState::Unsupported, path)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
     }
 
     #[test]

@@ -14,15 +14,13 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::ops::ControlFlow;
 
-use crate::cli::ExportFormat;
+use crate::cli::{ExportFormat, ExportSelinuxMode};
 
 /// Options for container export.
-#[derive(Debug, Default)]
-struct ExportOptions {
-    /// Copy kernel and initramfs to /boot for legacy compatibility.
+#[derive(Debug)]
+struct ExportOptions<'a> {
     kernel_in_boot: bool,
-    /// Disable SELinux labeling.
-    disable_selinux: bool,
+    selinux: &'a ExportSelinuxMode,
 }
 
 /// Export a container filesystem to tar format with bootc-specific features.
@@ -32,14 +30,14 @@ pub(crate) async fn export(
     target_path: &Utf8Path,
     output_path: Option<&Utf8Path>,
     kernel_in_boot: bool,
-    disable_selinux: bool,
+    selinux: &ExportSelinuxMode,
 ) -> Result<()> {
     use cap_std_ext::cap_std;
     use cap_std_ext::cap_std::fs::Dir;
 
     let options = ExportOptions {
         kernel_in_boot,
-        disable_selinux,
+        selinux,
     };
 
     let root_dir = Dir::open_ambient_dir(target_path, cap_std::ambient_authority())
@@ -55,7 +53,7 @@ pub(crate) async fn export(
 async fn export_tar(
     root_dir: &cap_std_ext::cap_std::fs::Dir,
     output_path: Option<&Utf8Path>,
-    options: &ExportOptions,
+    options: &ExportOptions<'_>,
 ) -> Result<()> {
     let output: Box<dyn Write> = match output_path {
         Some(path) => {
@@ -73,22 +71,49 @@ async fn export_tar(
     Ok(())
 }
 
+/// How to handle SELinux labeling during export.
+enum SepolicyState {
+    /// SELinux labeling is disabled (--selinux=disabled).
+    Disabled,
+    /// Missing labels are a hard error (--selinux=enabled, default).
+    Required(ostree::SePolicy),
+    /// Missing labels emit a warning and export continues (--selinux=warn-on-missing).
+    WarnOnMissing(ostree::SePolicy),
+}
+
 fn export_filesystem<W: Write>(
     tar_builder: &mut tar::Builder<W>,
     root_dir: &cap_std_ext::cap_std::fs::Dir,
-    options: &ExportOptions,
+    options: &ExportOptions<'_>,
 ) -> Result<()> {
     // Load SELinux policy from the image filesystem.
     // We use the policy to compute labels rather than reading xattrs from the
     // mounted filesystem, because OCI images don't usually include selinux xattrs,
     // and the mounted runtime will have e.g. container_t
-    let sepolicy = if options.disable_selinux {
-        None
+    let sepolicy_state = if *options.selinux == ExportSelinuxMode::Disabled {
+        SepolicyState::Disabled
     } else {
-        crate::lsm::new_sepolicy_at(root_dir)?
+        match crate::lsm::new_sepolicy_at(root_dir)? {
+            Some(policy) => match options.selinux {
+                ExportSelinuxMode::Enabled => SepolicyState::Required(policy),
+                ExportSelinuxMode::WarnOnMissing => SepolicyState::WarnOnMissing(policy),
+                ExportSelinuxMode::Disabled => unreachable!(),
+            },
+            None => {
+                tracing::warn!("SELinux labeling requested but no policy found in image");
+                SepolicyState::Disabled
+            }
+        }
     };
 
-    export_filesystem_walk(tar_builder, root_dir, sepolicy.as_ref())?;
+    let mut unlabeled_count = 0u64;
+    export_filesystem_walk(tar_builder, root_dir, &sepolicy_state, &mut unlabeled_count)?;
+
+    if unlabeled_count > 0 {
+        tracing::warn!(
+            "{unlabeled_count} file(s) exported without SELinux labels (no policy match)"
+        );
+    }
 
     if options.kernel_in_boot {
         handle_kernel_relocation(tar_builder, root_dir)?;
@@ -126,13 +151,19 @@ fn tar_header_dir_root() -> tar::Header {
 }
 
 /// Paths that should be skipped during export.
-/// These are bootc/ostree-specific paths that shouldn't be in the exported tarball.
-const SKIP_PATHS: &[&str] = &["sysroot/ostree"];
+/// - `sysroot/ostree` is bootc/ostree-specific and shouldn't be in the exported tarball.
+/// - `tmp` and `var/tmp` are meant to hold only ephemeral, runtime-created content (the
+///   same paths `ostree-ext::commit` always cleans before committing). They can end up
+///   containing arbitrary files dropped by package post-install scripts (e.g. `rhc`)
+///   that the SELinux policy has no file-context entry for, which would otherwise turn
+///   into a hard failure when computing labels for the tar entries.
+const SKIP_PATHS: &[&str] = &["sysroot/ostree", "tmp", "var/tmp"];
 
 fn export_filesystem_walk<W: Write>(
     tar_builder: &mut tar::Builder<W>,
     root_dir: &cap_std_ext::cap_std::fs::Dir,
-    sepolicy: Option<&ostree::SePolicy>,
+    sepolicy_state: &SepolicyState,
+    unlabeled_count: &mut u64,
 ) -> Result<()> {
     use std::path::Path;
 
@@ -177,8 +208,15 @@ fn export_filesystem_walk<W: Write>(
 
         let file_type = entry.file_type;
         if file_type.is_dir() {
-            add_directory_to_tar_from_walk(tar_builder, entry.dir, path, relative_path, sepolicy)
-                .map_err(std::io::Error::other)?;
+            add_directory_to_tar_from_walk(
+                tar_builder,
+                entry.entry,
+                path,
+                relative_path,
+                sepolicy_state,
+                unlabeled_count,
+            )
+            .map_err(std::io::Error::other)?;
         } else if file_type.is_file() {
             add_file_to_tar_from_walk(
                 tar_builder,
@@ -186,7 +224,8 @@ fn export_filesystem_walk<W: Write>(
                 entry.filename,
                 path,
                 relative_path,
-                sepolicy,
+                sepolicy_state,
+                unlabeled_count,
                 &mut hardlinks,
             )
             .map_err(std::io::Error::other)?;
@@ -197,7 +236,8 @@ fn export_filesystem_walk<W: Write>(
                 entry.filename,
                 path,
                 relative_path,
-                sepolicy,
+                sepolicy_state,
+                unlabeled_count,
             )
             .map_err(std::io::Error::other)?;
         } else {
@@ -215,20 +255,29 @@ fn export_filesystem_walk<W: Write>(
 
 fn add_directory_to_tar_from_walk<W: Write>(
     tar_builder: &mut tar::Builder<W>,
-    dir: &cap_std_ext::cap_std::fs::Dir,
+    entry: &cap_std_ext::cap_std::fs::DirEntry,
     absolute_path: &std::path::Path,
     relative_path: &std::path::Path,
-    sepolicy: Option<&ostree::SePolicy>,
+    sepolicy_state: &SepolicyState,
+    unlabeled_count: &mut u64,
 ) -> Result<()> {
     use cap_std_ext::cap_primitives::fs::PermissionsExt;
 
-    let metadata = dir.dir_metadata()?;
+    let metadata = entry.metadata().with_context(|| {
+        format!(
+            "Failed to read directory metadata: {}",
+            relative_path.display()
+        )
+    })?;
     let mut header = tar_header_from_meta(tar::EntryType::Directory, 0, &metadata);
 
-    if let Some(policy) = sepolicy {
-        let label = compute_selinux_label(policy, absolute_path, metadata.permissions().mode())?;
-        add_selinux_pax_extension(tar_builder, &label)?;
-    }
+    maybe_add_selinux_label(
+        tar_builder,
+        sepolicy_state,
+        absolute_path,
+        metadata.permissions().mode(),
+        unlabeled_count,
+    )?;
 
     tar_builder
         .append_data(&mut header, relative_path, &mut std::io::empty())
@@ -243,7 +292,8 @@ fn add_file_to_tar_from_walk<W: Write>(
     filename: &std::ffi::OsStr,
     absolute_path: &std::path::Path,
     relative_path: &std::path::Path,
-    sepolicy: Option<&ostree::SePolicy>,
+    sepolicy_state: &SepolicyState,
+    unlabeled_count: &mut u64,
     hardlinks: &mut HashMap<(u64, u64), std::path::PathBuf>,
 ) -> Result<()> {
     use cap_std_ext::cap_primitives::fs::{MetadataExt, PermissionsExt};
@@ -259,32 +309,34 @@ fn add_file_to_tar_from_walk<W: Write>(
     if nlink > 1 {
         let key = (metadata.dev(), metadata.ino());
         if let Some(first_path) = hardlinks.get(&key) {
-            // This is a hardlink to a file we've already written
             let mut header = tar_header_from_meta(tar::EntryType::Link, 0, &metadata);
 
-            if let Some(policy) = sepolicy {
-                let label =
-                    compute_selinux_label(policy, absolute_path, metadata.permissions().mode())?;
-                add_selinux_pax_extension(tar_builder, &label)?;
-            }
+            maybe_add_selinux_label(
+                tar_builder,
+                sepolicy_state,
+                absolute_path,
+                metadata.permissions().mode(),
+                unlabeled_count,
+            )?;
 
             tar_builder
                 .append_link(&mut header, relative_path, first_path)
                 .with_context(|| format!("Failed to add hardlink: {}", relative_path.display()))?;
             return Ok(());
         } else {
-            // First time seeing this inode, record it
             hardlinks.insert(key, relative_path.to_path_buf());
         }
     }
 
-    // Regular file (or first occurrence of a hardlinked file)
     let mut header = tar_header_from_meta(tar::EntryType::Regular, metadata.len(), &metadata);
 
-    if let Some(policy) = sepolicy {
-        let label = compute_selinux_label(policy, absolute_path, metadata.permissions().mode())?;
-        add_selinux_pax_extension(tar_builder, &label)?;
-    }
+    maybe_add_selinux_label(
+        tar_builder,
+        sepolicy_state,
+        absolute_path,
+        metadata.permissions().mode(),
+        unlabeled_count,
+    )?;
 
     let mut file = dir.open(filename_path)?;
     tar_builder
@@ -300,7 +352,8 @@ fn add_symlink_to_tar_from_walk<W: Write>(
     filename: &std::ffi::OsStr,
     absolute_path: &std::path::Path,
     relative_path: &std::path::Path,
-    sepolicy: Option<&ostree::SePolicy>,
+    sepolicy_state: &SepolicyState,
+    unlabeled_count: &mut u64,
 ) -> Result<()> {
     use cap_std_ext::cap_primitives::fs::PermissionsExt;
     use std::path::Path;
@@ -312,12 +365,14 @@ fn add_symlink_to_tar_from_walk<W: Write>(
     let metadata = dir.symlink_metadata(filename_path)?;
     let mut header = tar_header_from_meta(tar::EntryType::Symlink, 0, &metadata);
 
-    if let Some(policy) = sepolicy {
-        // For symlinks, combine S_IFLNK with mode for proper label lookup
-        let symlink_mode = libc::S_IFLNK | (metadata.permissions().mode() & !libc::S_IFMT);
-        let label = compute_selinux_label(policy, absolute_path, symlink_mode)?;
-        add_selinux_pax_extension(tar_builder, &label)?;
-    }
+    let symlink_mode = libc::S_IFLNK | (metadata.permissions().mode() & !libc::S_IFMT);
+    maybe_add_selinux_label(
+        tar_builder,
+        sepolicy_state,
+        absolute_path,
+        symlink_mode,
+        unlabeled_count,
+    )?;
 
     tar_builder
         .append_link(&mut header, relative_path, &link_target)
@@ -386,21 +441,42 @@ fn append_dir_entry<W: Write>(tar_builder: &mut tar::Builder<W>, path: &str) -> 
     Ok(())
 }
 
-fn compute_selinux_label(
-    policy: &ostree::SePolicy,
-    path: &std::path::Path,
+fn maybe_add_selinux_label<W: Write>(
+    tar_builder: &mut tar::Builder<W>,
+    sepolicy_state: &SepolicyState,
+    absolute_path: &std::path::Path,
     mode: u32,
-) -> Result<String> {
-    use camino::Utf8Path;
+    unlabeled_count: &mut u64,
+) -> Result<()> {
+    let (policy, warn) = match sepolicy_state {
+        SepolicyState::Disabled => return Ok(()),
+        SepolicyState::Required(p) => (p, false),
+        SepolicyState::WarnOnMissing(p) => (p, true),
+    };
 
-    // Convert path to UTF-8 for policy lookup - non-UTF8 paths are not supported
-    let path_str = path
+    let path_str = absolute_path
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Non-UTF8 path not supported: {:?}", path))?;
+        .ok_or_else(|| anyhow::anyhow!("Non-UTF8 path not supported: {:?}", absolute_path))?;
     let utf8_path = Utf8Path::new(path_str);
 
-    let label = crate::lsm::require_label(policy, utf8_path, mode)?;
-    Ok(label.to_string())
+    match crate::lsm::optional_label(policy, utf8_path, mode)? {
+        Some(label) if !label.is_empty() => {
+            add_selinux_pax_extension(tar_builder, &label)?;
+        }
+        _ if !warn => {
+            anyhow::bail!(
+                "No label found in policy '{:?}' for {}",
+                policy.csum(),
+                absolute_path.display()
+            );
+        }
+        _ => {
+            *unlabeled_count += 1;
+            tracing::debug!("No SELinux label for: {}", absolute_path.display());
+        }
+    }
+
+    Ok(())
 }
 
 fn add_selinux_pax_extension<W: Write>(
@@ -411,4 +487,123 @@ fn add_selinux_pax_extension<W: Write>(
         .append_pax_extensions([("SCHILY.xattr.security.selinux", selinux_context.as_bytes())])
         .context("Failed to add SELinux PAX extension")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cap_std_ext::cap_std::{ambient_authority, fs::Dir};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Walk `root` (with SELinux labeling disabled) and return the set of
+    /// relative paths that ended up in the resulting tar archive.
+    fn exported_paths(root: &std::path::Path) -> Result<std::collections::BTreeSet<String>> {
+        let dir = Dir::open_ambient_dir(root, ambient_authority())?;
+        let mut buf = Vec::new();
+        {
+            let mut tar_builder = tar::Builder::new(&mut buf);
+            let mut unlabeled_count = 0u64;
+            export_filesystem_walk(
+                &mut tar_builder,
+                &dir,
+                &SepolicyState::Disabled,
+                &mut unlabeled_count,
+            )?;
+            tar_builder.finish()?;
+        }
+        tar::Archive::new(buf.as_slice())
+            .entries()?
+            .map(|e| Ok(e?.path()?.to_string_lossy().into_owned()))
+            .collect()
+    }
+
+    /// Walk `root` (with SELinux labeling disabled) and return modes for tar directories.
+    fn exported_directory_modes(
+        root: &std::path::Path,
+    ) -> Result<std::collections::BTreeMap<String, u32>> {
+        let dir = Dir::open_ambient_dir(root, ambient_authority())?;
+        let mut buf = Vec::new();
+        {
+            let mut tar_builder = tar::Builder::new(&mut buf);
+            export_filesystem_walk(&mut tar_builder, &dir, &SepolicyState::Disabled, &mut 0)?;
+            tar_builder.finish()?;
+        }
+
+        let mut modes = std::collections::BTreeMap::new();
+        for entry in tar::Archive::new(buf.as_slice()).entries()? {
+            let entry = entry?;
+            if entry.header().entry_type() != tar::EntryType::Directory {
+                continue;
+            }
+            let path = entry
+                .path()?
+                .to_string_lossy()
+                .trim_end_matches('/')
+                .to_owned();
+            modes.insert(path, entry.header().mode()? & 0o7777);
+        }
+        Ok(modes)
+    }
+
+    #[test]
+    fn test_export_skips_tmp_and_var_tmp() -> Result<()> {
+        let tmpdir = tempfile::tempdir()?;
+        let root = tmpdir.path();
+
+        // Content that must be skipped, including a stand-in for the
+        // `/var/tmp/rhc` file dropped by package post-install scripts that
+        // the SELinux policy has no file-context entry for.
+        std::fs::create_dir_all(root.join("tmp/nested"))?;
+        std::fs::write(root.join("tmp/nested/junk"), b"junk")?;
+        std::fs::create_dir_all(root.join("var/tmp"))?;
+        std::fs::write(root.join("var/tmp/rhc"), b"rhc-state")?;
+
+        // Content that must be preserved.
+        std::fs::create_dir_all(root.join("usr/bin"))?;
+        std::fs::write(root.join("usr/bin/keep-me"), b"binary")?;
+        std::fs::create_dir_all(root.join("var/lib"))?;
+        std::fs::write(root.join("var/lib/keep-me-too"), b"state")?;
+
+        let paths = exported_paths(root)?;
+
+        assert!(paths.contains("usr/bin/keep-me"));
+        assert!(paths.contains("var/lib/keep-me-too"));
+        assert!(
+            !paths.iter().any(|p| p == "tmp" || p.starts_with("tmp/")),
+            "expected no /tmp entries, got: {paths:?}"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p == "var/tmp" || p.starts_with("var/tmp/")),
+            "expected no /var/tmp entries, got: {paths:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_export_preserves_directory_modes() -> Result<()> {
+        let tmpdir = tempfile::tempdir()?;
+        let root = tmpdir.path();
+        let directories = [
+            ("var", 0o2750),
+            ("var/lib", 0o0711),
+            ("var/lib/nested", 0o0751),
+            ("var/cache", 0o0700),
+        ];
+
+        for (path, mode) in directories {
+            let path = root.join(path);
+            std::fs::create_dir_all(&path)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        }
+
+        let modes = exported_directory_modes(root)?;
+        for (path, expected) in directories {
+            assert_eq!(modes.get(path), Some(&expected), "mode for {path}");
+        }
+
+        Ok(())
+    }
 }

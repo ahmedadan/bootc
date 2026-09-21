@@ -17,7 +17,10 @@ use crate::bootc_composefs::gc::GCOpts;
 use crate::spec::BootloaderKind;
 use crate::{
     bootc_composefs::{
-        boot::{BootSetupType, BootType, setup_composefs_bls_boot, setup_composefs_uki_boot},
+        boot::{
+            BootSetupType, BootType, UKIDigestMismatch, print_uki_dumpfile_diff,
+            setup_composefs_bls_boot, setup_composefs_uki_boot,
+        },
         gc::composefs_gc,
         repo::pull_composefs_repo,
         service::start_finalize_stated_svc,
@@ -263,6 +266,7 @@ pub(crate) async fn do_upgrade(
         entries,
         id,
         manifest_digest,
+        fs: oci_fs,
     } = pull_composefs_repo(
         imgref,
         booted_cfs.cmdline.allow_missing_fsverity,
@@ -320,13 +324,40 @@ pub(crate) async fn do_upgrade(
             &mounted_fs,
         )?,
 
-        BootType::Uki => setup_composefs_uki_boot(
-            BootSetupType::Upgrade((storage, booted_cfs, &host)),
-            &repo,
-            &id,
-            entries,
-        )?,
+        BootType::Uki => {
+            let uki_setup_result = setup_composefs_uki_boot(
+                BootSetupType::Upgrade((storage, booted_cfs, &host)),
+                &repo,
+                &id,
+                entries,
+            );
+
+            match uki_setup_result {
+                Ok(boot_digest) => boot_digest,
+                Err(e) => match e.downcast::<UKIDigestMismatch>() {
+                    Ok(mismatch) => {
+                        print_uki_dumpfile_diff(&mismatch, &repo, &oci_fs);
+                        return Err(mismatch.into());
+                    }
+                    Err(e) => Err(e)?,
+                },
+            }
+        }
     };
+
+    // `repo` holds its own flock(LOCK_SH) on /sysroot/composefs, taken out by
+    // pull_composefs_repo() on a *different* open-file-description than the
+    // one `booted_cfs.repo` uses. Below, composefs_gc() will ask `booted_cfs.repo`
+    // to take flock(LOCK_EX) on the same underlying file. Since two independent
+    // opens of the same file by one process don't share flock() state, that
+    // exclusive lock would block forever on the shared lock we're still holding
+    // here unless we drop `repo` first. `mounted_fs` is a mount of `repo`'s
+    // content, so it's dropped alongside it for the same reason. (`entries` is
+    // already consumed by this point in the BootType::Uki arm above, so there's
+    // nothing left to drop there.)
+    // See https://github.com/bootc-dev/bootc/issues/2364.
+    drop(mounted_fs);
+    drop(repo);
 
     let staged_state = StagedDeployment {
         depl_id: id.to_hex(),
@@ -347,6 +378,10 @@ pub(crate) async fn do_upgrade(
 
     // We take into account the staged bootloader entries so this won't remove
     // the currently staged entry
+    //
+    // Note: this takes an exclusive flock via `booted_cfs.repo`; no other
+    // `Repository` handle on the same underlying file may still be alive here
+    // (see the `drop(repo)` above for why).
     composefs_gc(
         storage,
         booted_cfs,
@@ -358,6 +393,59 @@ pub(crate) async fn do_upgrade(
     .await?;
 
     apply_upgrade(storage, booted_cfs, &id.to_hex(), opts).await
+}
+
+#[context("Applying downloaded upgrade")]
+pub(crate) async fn apply_upgrade_from_downloaded(
+    storage: &Storage,
+    composefs: &BootedComposefs,
+    host: &Host,
+    do_upgrade_opts: &DoUpgradeOpts,
+) -> Result<()> {
+    let staged = host
+        .status
+        .staged
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No staged deployment found"))?;
+
+    // Staged deployment exists, but it will be finalized
+    if !staged.download_only {
+        println!("Staged deployment is present and not in download only mode.");
+        println!("Use `bootc update --apply` to apply the update.");
+        return Ok(());
+    }
+
+    start_finalize_stated_svc()?;
+
+    let staged_depl_dir = Dir::open_ambient_dir(COMPOSEFS_TRANSIENT_STATE_DIR, ambient_authority())
+        .context("Opening transient state directory")?;
+
+    let current = staged_depl_dir
+        .read_to_string(COMPOSEFS_STAGED_DEPLOYMENT_FNAME)
+        .context("Reading staged file")?;
+
+    let mut new_staged: StagedDeployment =
+        serde_json::from_str(&current).context("Deserialzing staged file")?;
+
+    // Make the staged deployment not download_only
+    new_staged.finalization_locked = false;
+
+    staged_depl_dir
+        .atomic_replace_with(
+            COMPOSEFS_STAGED_DEPLOYMENT_FNAME,
+            |f| -> std::io::Result<()> {
+                serde_json::to_writer(f, &new_staged).map_err(std::io::Error::from)
+            },
+        )
+        .context("Writing staged file")?;
+
+    return apply_upgrade(
+        storage,
+        composefs,
+        &staged.require_composefs()?.verity,
+        &do_upgrade_opts,
+    )
+    .await;
 }
 
 #[context("Upgrading composefs")]
@@ -372,8 +460,8 @@ pub(crate) async fn upgrade_composefs(
         message_id = COMPOSEFS_UPGRADE_JOURNAL_ID,
         bootc.operation = "upgrade",
         bootc.apply_mode = opts.apply,
-        bootc.download_only = opts.download_only,
-        bootc.from_downloaded = opts.from_downloaded,
+        bootc.download_only = opts.download_opts.download_only,
+        bootc.from_downloaded = opts.download_opts.from_downloaded,
         "Starting composefs upgrade operation"
     );
 
@@ -398,58 +486,14 @@ pub(crate) async fn upgrade_composefs(
     let mut do_upgrade_opts = DoUpgradeOpts {
         soft_reboot: opts.soft_reboot,
         apply: opts.apply,
-        download_only: opts.download_only,
+        download_only: opts.download_opts.download_only,
         use_unified: false,
         quiet: opts.quiet,
         prog,
     };
 
-    if opts.from_downloaded {
-        let staged = host
-            .status
-            .staged
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No staged deployment found"))?;
-
-        // Staged deployment exists, but it will be finalized
-        if !staged.download_only {
-            println!("Staged deployment is present and not in download only mode.");
-            println!("Use `bootc update --apply` to apply the update.");
-            return Ok(());
-        }
-
-        start_finalize_stated_svc()?;
-
-        let staged_depl_dir =
-            Dir::open_ambient_dir(COMPOSEFS_TRANSIENT_STATE_DIR, ambient_authority())
-                .context("Opening transient state directory")?;
-
-        let current = staged_depl_dir
-            .read_to_string(COMPOSEFS_STAGED_DEPLOYMENT_FNAME)
-            .context("Reading staged file")?;
-
-        let mut new_staged: StagedDeployment =
-            serde_json::from_str(&current).context("Deserialzing staged file")?;
-
-        // Make the staged deployment not download_only
-        new_staged.finalization_locked = false;
-
-        staged_depl_dir
-            .atomic_replace_with(
-                COMPOSEFS_STAGED_DEPLOYMENT_FNAME,
-                |f| -> std::io::Result<()> {
-                    serde_json::to_writer(f, &new_staged).map_err(std::io::Error::from)
-                },
-            )
-            .context("Writing staged file")?;
-
-        return apply_upgrade(
-            storage,
-            composefs,
-            &staged.require_composefs()?.verity,
-            &do_upgrade_opts,
-        )
-        .await;
+    if opts.download_opts.from_downloaded {
+        return apply_upgrade_from_downloaded(storage, composefs, &host, &do_upgrade_opts).await;
     }
 
     let imgref = derived_image.as_ref().or(current_image);
